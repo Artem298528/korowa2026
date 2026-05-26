@@ -1,0 +1,471 @@
+# Робот на ESP32: 2 шаговых двигателя + 2 дальномера VL53L0X + 3 сервы + 2 кнопки
+
+Управление движением по маршруту с защитой от препятствий. Моторы включаются только при реальном движении, сервы всегда под напряжением (не отключаются после отработки). После завершения маршрута серва-актуатор (GPIO12) плавно вращается.
+
+## Подключение
+
+- **Шаговые** (A4988):  
+  Мотор1: STEP=25, DIR=33, EN=14  
+  Мотор2: STEP=27, DIR=26, EN=32  
+- **VL53L0X** (I2C): SDA=21, SCL=22, XSHUT_LEFT=19, XSHUT_RIGHT=18  
+  Адреса: левый 0x30, правый 0x29  
+- **Сервы**: 0→GPIO12 (актуатор), 1→GPIO16 (правый захват), 2→GPIO17 (левый захват)  
+- **Кнопки**: STARTER=23 (GND), SIDE=13 – выбор маршрута
+
+## Логика
+
+- После старта – таймаут 98 секунд.  
+- Дальномеры блокируют движение при препятствии <200 мм (флаг safety).  
+- Маршруты задаются массивом `RouteStep`.  
+- После маршрута или таймаута моторы выключаются, сервы остаются под напряжением и вращается актуатор.
+
+## Полный код
+
+```cpp
+/*
+  ============================================================
+  РОБОТ: 2 ШАГОВЫХ ДВИГАТЕЛЯ + 2 VL53L0X + 3 СЕРВЫ + 2 КНОПКИ
+  ============================================================
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <GyverStepper.h>
+#include <ESP32Servo.h>
+
+// ======================= ПИНЫ КНОПОК =======================
+const int STARTER_PIN = 23;
+const int SIDE_PIN    = 13;
+
+// ======================= ПИНЫ VL53L0X =======================
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define XSHUT_LEFT  19
+#define XSHUT_RIGHT 18
+#define VL53_ADDR_LEFT  0x30
+#define VL53_ADDR_RIGHT 0x29
+
+// ======================= ШАГОВЫЕ ДВИГАТЕЛИ =======================
+GStepper<STEPPER2WIRE> stepper1(800, 25, 33, 14);
+GStepper<STEPPER2WIRE> stepper2(800, 27, 26, 32);
+bool steppersEnabled = false;
+
+// ======================= СЕРВЫ =======================
+#define SERVO_UNUSED -1
+const int SERVO_COUNT = 3;
+const int SERVO_PINS[SERVO_COUNT] = {12, 16, 17};
+Servo servos[SERVO_COUNT];
+const int SERVO_MIN_US = 500;
+const int SERVO_MAX_US = 2500;
+
+const int GRIPPER_RIGHT_OPEN  = 0;
+const int GRIPPER_RIGHT_CLOSE = 60;
+const int GRIPPER_LEFT_OPEN   = 160;
+const int GRIPPER_LEFT_CLOSE  = 110;
+
+// ======================= ОСНОВНЫЕ НАСТРОЙКИ =======================
+const unsigned long MAX_RUN_TIME_MS = 93000;
+const unsigned long VL53_INTERVAL_MS = 100;
+const uint16_t OBSTACLE_LIMIT_MM = 200;
+bool vl53ManuallyDisabled = false;
+
+// ======================= VL53L0X =======================
+VL53L0X sensorLeft;
+VL53L0X sensorRight;
+uint16_t distLeft = 0, distRight = 0;
+bool vl53LeftOk = false, vl53RightOk = false;
+bool vl53NewData = false;
+unsigned long lastVL53Update = 0;
+
+// ======================= ТИПЫ ШАГОВ МАРШРУТА =======================
+enum StepType { MOVE_STEPPERS, SERVO_MOVE, SERVO_MOVE_2, PAUSE_STEP, END_ROUTE };
+
+struct RouteStep {
+  StepType type;
+  long motor1Steps, motor2Steps;
+  int servoIndex1, servoAngle1;
+  int servoIndex2, servoAngle2;
+  unsigned long timeMs;
+  bool useDistanceSafety;
+};
+
+// ======================= МАРШРУТ 1 (оранжевая) =======================
+RouteStep route1[] = {
+  {SERVO_MOVE_2, 0, 0, 1, 0, 2, 160, 500, true},
+  {MOVE_STEPPERS, 1000, -1000, -1, 0, -1, 0, 0, true},
+  {MOVE_STEPPERS, 1030, 1030, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1300, -1300, -1, 0, -1, 0, 0, false},
+  {SERVO_MOVE_2, 0, 0, 1, 70, 2, 100, 500, false},
+  {MOVE_STEPPERS, 1400, -1400, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -4500, 4500, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1000, -1000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1000, -1000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -1000, 1000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -1030, -1030, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 2500, -2500, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 750, 750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -750, -750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1760, -1760, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 750, 750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -750, -750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -1310, 1310, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 300, 300, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 400, -400, -1, 0, -1, 0, 0, false},
+  {SERVO_MOVE_2, 0, 0, 1, 0, 2, 160, 500, false},
+  {MOVE_STEPPERS, -1600, 1600, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 550, 550, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 2000, -2000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -550, -550, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1700, -1700, -1, 0, -1, 0, 0, false},
+};
+
+// ======================= МАРШРУТ 2 (синяя) =======================
+RouteStep route2[] = {
+  {SERVO_MOVE_2, 0, 0, 1, 0, 2, 160, 500, true},
+  {MOVE_STEPPERS, 1000, -1000, -1, 0, -1, 0, 0, true},
+  {MOVE_STEPPERS, -1030, -1030, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1300, -1300, -1, 0, -1, 0, 0, false},
+  {SERVO_MOVE_2, 0, 0, 1, 70, 2, 100, 500, false},
+  {MOVE_STEPPERS, 1400, -1400, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -4500, 4500, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1000, -1000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1000, -1000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -1000, 1000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1030, 1030, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 2500, -2500, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -750, -750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 750, 750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1760, -1760, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -750, -750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 750, 750, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -1310, 1310, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -300, -300, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 300, -300, -1, 0, -1, 0, 0, false},
+  {SERVO_MOVE_2, 0, 0, 1, 0, 2, 160, 500, false},
+  {MOVE_STEPPERS, -1600, 1600, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, -550, -550, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 2000, -2000, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 550, 550, -1, 0, -1, 0, 0, false},
+  {MOVE_STEPPERS, 1700, -1700, -1, 0, -1, 0, 0, false},
+};
+
+// ======================= ПЕРЕМЕННЫЕ МАРШРУТА =======================
+RouteStep* currentRoute = nullptr;
+int currentStepIndex = 0;
+bool stepStarted = false;
+bool motorsWereMoving = false;
+bool routeFinished = false;
+bool timeoutFinished = false;
+unsigned long stepStartTime = 0;
+unsigned long robotStartTime = 0;
+
+// ======================= ПРОТОТИПЫ =======================
+void initVL53();
+void updateVL53();
+bool isObstacleDetected();
+void printDistances();
+void setupSteppers();
+void enableSteppersIfNeeded();
+void disableSteppers();
+bool isServoAvailable(int index);
+void attachAndWriteServo(int index, int angle);
+void attachAndWriteTwoServos(int idx1, int ang1, int idx2, int ang2);
+void detachAllServos();
+void finalServoLoop();
+void startRouteStep(RouteStep step);
+bool isRouteStepFinished(RouteStep step, byte stepper1Move, byte stepper2Move);
+
+// ======================= РЕАЛИЗАЦИИ =======================
+void initVL53() {
+  pinMode(XSHUT_LEFT, OUTPUT);
+  pinMode(XSHUT_RIGHT, OUTPUT);
+  digitalWrite(XSHUT_LEFT, LOW);
+  digitalWrite(XSHUT_RIGHT, LOW);
+  delay(50);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(10);
+  digitalWrite(XSHUT_LEFT, HIGH);
+  delay(50);
+  sensorLeft.setTimeout(100);
+  if (sensorLeft.init()) {
+    sensorLeft.setAddress(VL53_ADDR_LEFT);
+    sensorLeft.setMeasurementTimingBudget(30000);
+    sensorLeft.startContinuous();
+    vl53LeftOk = true;
+    Serial.println("VL53 LEFT init OK, addr=0x30");
+  } else {
+    vl53LeftOk = false;
+    Serial.println("VL53 LEFT init FAIL");
+  }
+  digitalWrite(XSHUT_RIGHT, HIGH);
+  delay(50);
+  sensorRight.setTimeout(100);
+  if (sensorRight.init()) {
+    sensorRight.setMeasurementTimingBudget(30000);
+    sensorRight.startContinuous();
+    vl53RightOk = true;
+    Serial.println("VL53 RIGHT init OK, addr=0x29");
+  } else {
+    vl53RightOk = false;
+    Serial.println("VL53 RIGHT init FAIL");
+  }
+}
+
+void updateVL53() {
+  unsigned long now = millis();
+  if (now - lastVL53Update < VL53_INTERVAL_MS) return;
+  lastVL53Update = now;
+  vl53NewData = false;
+  if (vl53LeftOk) {
+    uint16_t value = sensorLeft.readRangeContinuousMillimeters();
+    if (!sensorLeft.timeoutOccurred()) distLeft = value;
+  }
+  if (vl53RightOk) {
+    uint16_t value = sensorRight.readRangeContinuousMillimeters();
+    if (!sensorRight.timeoutOccurred()) distRight = value;
+  }
+  vl53NewData = true;
+}
+
+bool isObstacleDetected() {
+  if (vl53ManuallyDisabled) return false;
+  bool leftBlocked  = (vl53LeftOk  && distLeft  > 0 && distLeft  < OBSTACLE_LIMIT_MM);
+  bool rightBlocked = (vl53RightOk && distRight > 0 && distRight < OBSTACLE_LIMIT_MM);
+  return leftBlocked || rightBlocked;
+}
+
+void printDistances() {
+  Serial.print("VL53 LEFT: ");
+  if (vl53LeftOk) Serial.print(distLeft); else Serial.print("ERR");
+  Serial.print(" mm | RIGHT: ");
+  if (vl53RightOk) Serial.print(distRight); else Serial.print("ERR");
+  Serial.println(" mm");
+}
+
+void setupSteppers() {
+  stepper1.setRunMode(FOLLOW_POS);
+  stepper2.setRunMode(FOLLOW_POS);
+  stepper1.setMaxSpeed(500);
+  stepper1.setAcceleration(500);
+  stepper2.setMaxSpeed(500);
+  stepper2.setAcceleration(500);
+  stepper1.autoPower(true);
+  stepper2.autoPower(true);
+  stepper1.reverse(false);
+  stepper2.reverse(true);
+  stepper1.disable();
+  stepper2.disable();
+  steppersEnabled = false;
+  Serial.println("STEPPERS CONFIGURED, DISABLED");
+}
+
+void enableSteppersIfNeeded() {
+  if (!steppersEnabled) {
+    stepper1.enable();
+    stepper2.enable();
+    steppersEnabled = true;
+    Serial.println("STEPPERS ENABLED");
+  }
+}
+
+void disableSteppers() {
+  stepper1.disable();
+  stepper2.disable();
+  steppersEnabled = false;
+  Serial.println("STEPPERS DISABLED");
+}
+
+bool isServoAvailable(int index) {
+  return (index >= 0 && index < SERVO_COUNT && SERVO_PINS[index] != SERVO_UNUSED);
+}
+
+void attachAndWriteServo(int index, int angle) {
+  if (!isServoAvailable(index)) return;
+  angle = constrain(angle, 0, 180);
+  servos[index].attach(SERVO_PINS[index], SERVO_MIN_US, SERVO_MAX_US);
+  servos[index].write(angle);
+  Serial.printf("SERVO %d (GPIO%d) -> %d°\n", index, SERVO_PINS[index], angle);
+}
+
+void attachAndWriteTwoServos(int idx1, int ang1, int idx2, int ang2) {
+  attachAndWriteServo(idx1, ang1);
+  attachAndWriteServo(idx2, ang2);
+}
+
+void detachAllServos() {
+  // Функция оставлена, но нигде не вызывается – сервы всегда под напряжением.
+  // for (int i = 0; i < SERVO_COUNT; i++) {
+  //   if (isServoAvailable(i)) servos[i].detach();
+  // }
+  Serial.println("detachAllServos() called but detach is disabled");
+}
+
+void finalServoLoop() {
+  const int actuatorIdx = 0;
+  if (!isServoAvailable(actuatorIdx)) {
+    delay(1000);
+    return;
+  }
+  servos[actuatorIdx].attach(SERVO_PINS[actuatorIdx], SERVO_MIN_US, SERVO_MAX_US);
+  while (true) {
+    for (int angle = 0; angle <= 180; angle++) {
+      servos[actuatorIdx].write(angle);
+      delay(15);
+    }
+    for (int angle = 180; angle >= 0; angle--) {
+      servos[actuatorIdx].write(angle);
+      delay(15);
+    }
+  }
+}
+
+void startRouteStep(RouteStep step) {
+  stepStartTime = millis();
+  if (step.type == MOVE_STEPPERS) {
+    motorsWereMoving = false;
+    Serial.printf("MOVE: %ld / %ld steps\n", step.motor1Steps, step.motor2Steps);
+    enableSteppersIfNeeded();
+    stepper1.setTarget(step.motor1Steps, RELATIVE);
+    stepper2.setTarget(step.motor2Steps, RELATIVE);
+  }
+  else if (step.type == SERVO_MOVE) {
+    Serial.println("SERVO_MOVE");
+    attachAndWriteServo(step.servoIndex1, step.servoAngle1);
+  }
+  else if (step.type == SERVO_MOVE_2) {
+    Serial.println("SERVO_MOVE_2");
+    attachAndWriteTwoServos(step.servoIndex1, step.servoAngle1,
+                            step.servoIndex2, step.servoAngle2);
+  }
+  else if (step.type == PAUSE_STEP) {
+    Serial.printf("PAUSE: %lu ms\n", step.timeMs);
+  }
+  stepStarted = true;
+}
+
+bool isRouteStepFinished(RouteStep step, byte stepper1Move, byte stepper2Move) {
+  if (step.type == MOVE_STEPPERS) {
+    if (stepper1Move != 0 || stepper2Move != 0) motorsWereMoving = true;
+    return motorsWereMoving && stepper1Move == 0 && stepper2Move == 0;
+  }
+  if (step.type == SERVO_MOVE || step.type == SERVO_MOVE_2) {
+    if (millis() - stepStartTime >= step.timeMs) {
+      // detachAllServos();   // отключено – сервы остаются под напряжением
+      return true;
+    }
+    return false;
+  }
+  if (step.type == PAUSE_STEP) {
+    return (millis() - stepStartTime >= step.timeMs);
+  }
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n========================================");
+  Serial.println("ROBOT START – STEPPERS ENABLE ONLY ON MOVE");
+  Serial.println("SERVOS ALWAYS POWERED (NO DETACH)");
+  Serial.println("========================================");
+
+  pinMode(STARTER_PIN, INPUT_PULLUP);
+  pinMode(SIDE_PIN, INPUT_PULLUP);
+
+  setupSteppers();
+  initVL53();
+
+  Serial.println("Servo configuration:");
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    Serial.printf("Servo %d: ", i);
+    if (SERVO_PINS[i] == SERVO_UNUSED) Serial.println("UNUSED");
+    else Serial.printf("GPIO%d\n", SERVO_PINS[i]);
+  }
+
+  if (digitalRead(SIDE_PIN) == LOW) {
+    currentRoute = route2;
+    Serial.println("Selected route: 2 (blue)");
+  } else {
+    currentRoute = route1;
+    Serial.println("Selected route: 1 (orange)");
+  }
+
+  Serial.println("Waiting STARTER press...");
+  while (digitalRead(STARTER_PIN) == HIGH) {
+    updateVL53();
+    if (vl53NewData) {
+      vl53NewData = false;
+      printDistances();
+    }
+    delay(20);
+  }
+  delay(100);
+  robotStartTime = millis();
+  Serial.println("START!");
+}
+
+void loop() {
+  updateVL53();
+  if (vl53NewData) {
+    vl53NewData = false;
+    printDistances();
+  }
+
+  if (!routeFinished && !timeoutFinished) {
+    if (millis() - robotStartTime >= MAX_RUN_TIME_MS) {
+      timeoutFinished = true;
+      routeFinished = true;
+      disableSteppers();
+      // detachAllServos();
+      Serial.println("TIMEOUT 98 SEC. ROUTE STOPPED.");
+    }
+  }
+
+  if (routeFinished) {
+    finalServoLoop();
+    return;
+  }
+
+  RouteStep currentStep = currentRoute[currentStepIndex];
+
+  if (currentStep.type == END_ROUTE) {
+    routeFinished = true;
+    disableSteppers();
+    // detachAllServos();
+    Serial.println("ROUTE FINISHED. FINAL SERVO LOOP STARTED.");
+    return;
+  }
+
+  bool blocked = currentStep.useDistanceSafety && isObstacleDetected();
+  static bool wasBlocked = false;
+  if (blocked) {
+    if (!wasBlocked) {
+      Serial.println("OBSTACLE! Waiting...");
+      printDistances();
+      wasBlocked = true;
+    }
+    delay(5);
+    return;
+  }
+  if (wasBlocked) {
+    Serial.println("Obstacle cleared. Continue.");
+    printDistances();
+    wasBlocked = false;
+  }
+
+  byte stepper1Move = stepper1.tick();
+  byte stepper2Move = stepper2.tick();
+
+  if (!stepStarted) {
+    startRouteStep(currentStep);
+  }
+
+  if (isRouteStepFinished(currentStep, stepper1Move, stepper2Move)) {
+    Serial.printf("Step %d finished.\n", currentStepIndex);
+    currentStepIndex++;
+    stepStarted = false;
+    motorsWereMoving = false;
+    delay(50);
+  }
+}

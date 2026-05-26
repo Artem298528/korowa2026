@@ -1,5 +1,3 @@
-тестирование сервоприводов захвата и акруатор
-
 #include <Arduino.h>
 #include <ESP32Servo.h>
 

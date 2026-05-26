@@ -1,5 +1,3 @@
-тестирование шаговых двигателей
-
 
 #include <GyverStepper.h>
 GStepper<STEPPER2WIRE> stepper1(800, 25, 33, 14);

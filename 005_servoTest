@@ -1,0 +1,67 @@
+тестирование сервоприводов захвата и акруатор
+
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+Servo servo33;
+Servo servo25;
+
+const int SERVO_PIN_33 = 12;
+const int SERVO_PIN_25 = 16;
+
+const int MIN_US = 500;
+const int MAX_US = 2500;
+
+unsigned long lastCommandTime = 0;
+bool servosAttached = false;
+
+void attachServos() {
+  if (!servosAttached) {
+    servo33.attach(SERVO_PIN_33, MIN_US, MAX_US);
+    servo25.attach(SERVO_PIN_25, MIN_US, MAX_US);
+    servosAttached = true;
+  }
+}
+
+void detachServos() {
+  if (servosAttached) {
+    servo33.detach();
+    servo25.detach();
+    servosAttached = false;
+    Serial.println("Servos detached");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("ESP32 Servo test");
+  Serial.println("Enter angle 0..180:");
+}
+
+void loop() {
+  if (Serial.available()) {
+    int angle = Serial.parseInt();
+
+    while (Serial.available()) {
+      Serial.read();
+    }
+
+    angle = constrain(angle, 0, 180);
+
+    attachServos();
+
+    servo33.write(angle);
+    servo25.write(angle);
+
+    lastCommandTime = millis();
+
+    Serial.print("Angle set: ");
+    Serial.println(angle);
+  }
+
+  if (servosAttached && millis() - lastCommandTime >= 500) {
+    detachServos();
+  }
+}
